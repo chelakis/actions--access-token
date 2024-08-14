@@ -20,11 +20,11 @@ export const config: Readonly<Config> = {
   },
   accessPolicyLocation: {
     owner: {
-      repo: '.github-access-token',
-      paths: ['access-token.yaml', 'access-token.yml'],
+      repo: 'nexthink/github-as-code',
+      paths: ['_action-token-policy.yml'],
     },
     repo: {
-      paths: ['.github/access-token.yaml', '.github/access-token.yml'],
+      paths: ['_action-token-policy.yml'],
     },
   },
 };
