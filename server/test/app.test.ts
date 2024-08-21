@@ -1,5 +1,5 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 // noinspection DuplicatedCode
-/* eslint-disable @typescript-eslint/no-explicit-any,padded-blocks */
 
 import process from 'process';
 import YAML from 'yaml';
@@ -26,7 +26,9 @@ mockJwks();
 const githubMockEnvironment = mockGithub();
 
 const {config} = await import('../src/config');
-const {app} = await import('../src/app');
+const {appInit} = await import('../src/app');
+
+const app = appInit();
 
 beforeEach(() => githubMockEnvironment.reset());
 
@@ -450,7 +452,7 @@ describe('App path /access_tokens', () => {
           error: 'Forbidden',
           message: expect.stringMatching(joinRegExp([/^Issues:\n/,
             `- ${actionRepo.owner}:\n`,
-            / {2}- Not authorized\n/,
+            / {2}- secrets: write - '[^']+' installation not authorized\n/,
           ])),
         });
       });
@@ -529,7 +531,6 @@ describe('App path /access_tokens', () => {
           message: expect.stringMatching(joinRegExp([/^Issues:\n/,
             `- ${actionRepo.owner}:\n`,
             / {2}- Invalid access policy\n/,
-            / {2} {2}- origin: .+\n/,
           ])),
         });
       });
@@ -645,7 +646,7 @@ describe('App path /access_tokens', () => {
             error: 'Forbidden',
             message: expect.stringMatching(joinRegExp([/^Issues:\n/,
               `- ${actionRepo.owner}:\n`,
-              / {2}- contents: write - Not authorized\n/,
+              / {2}- contents: write - Not allowed by owner access policy\n/,
             ])),
           });
         });
@@ -1179,7 +1180,7 @@ describe('App path /access_tokens', () => {
  */
 function mockJwks() {
   jest.unstable_mockModule('get-jwks', () => {
-    const actual = jest.requireActual('get-jwks') as any;
+    const actual = jest.requireActual<any>('get-jwks');
     return {
       default: jest.fn().mockImplementation((params) => ({
         ...actual(params),

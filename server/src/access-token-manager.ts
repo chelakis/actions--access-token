@@ -63,71 +63,76 @@ export async function accessTokenManager(options: {
    * @param tokenRequest - token request
    * @return access token
    */
-  async function createAccessToken(
-      callerIdentity: GitHubActionsJwtPayload,
-      tokenRequest: {
-        scope: 'owner', owner: string, permissions: GitHubAppPermissions,
-        repositories?: string[],
-      } | {
-        scope: 'repos', owner: string, permissions: GitHubAppRepositoryPermissions,
-        repositories: string[],
-      },
+  async function createAccessToken(callerIdentity: GitHubActionsJwtPayload, tokenRequest: GitHubAccessTokenRequest,
   ) {
     const effectiveCallerIdentitySubjects = getEffectiveCallerIdentitySubjects(callerIdentity);
 
+    // grant requested permissions explicitly to prevent accidental permission escalation
+    const grantedTokenPermissions: Record<string, string> = {};
+    const pendingTokenPermissions: Record<string, string> = {...tokenRequest.permissions};
+
+    // --- get target app installation ---------------------------------------------------------------------------------
     const appInstallation = await getAppInstallation(GITHUB_APP_CLIENT, {
       owner: tokenRequest.owner,
     });
-    if (!appInstallation) {
-      throw new GithubAccessTokenError([{
-        owner: tokenRequest.owner,
-        // BE AWARE to prevent leaking owner existence
-        issues: tokenRequest.owner !== callerIdentity.repository_owner ?
-            [NOT_AUTHORIZED_MESSAGE] :
-            [`'${GITHUB_APP.name}' has not been installed. Install from ${GITHUB_APP.html_url}`],
-      }], effectiveCallerIdentitySubjects);
-    }
-    log.debug({appInstallation}, 'App installation');
+    {
+      if (!appInstallation) {
+        log.info({owner: tokenRequest.owner},
+            `'${GITHUB_APP.name}' has not been installed`);
+        throw new GitHubAccessTokenError([{
+          owner: tokenRequest.owner,
+          // BE AWARE to prevent leaking owner existence
+          issues: callerIdentity.repository_owner === tokenRequest.owner ?
+              [`'${GITHUB_APP.name}' has not been installed. Install from ${GITHUB_APP.html_url}`] :
+              [NOT_AUTHORIZED_MESSAGE],
+        }], effectiveCallerIdentitySubjects);
+      }
+      log.debug({appInstallation}, 'App installation');
 
-    const accessPolicyPaths = [...options.accessPolicyLocation.owner.paths, ...options.accessPolicyLocation.repo.paths];
-    if (!accessPolicyPaths.every((path) => appInstallation.single_file_paths?.includes(path))) {
-      log.debug({required: accessPolicyPaths, actual: appInstallation.single_file_paths},
-          `App installation is missing 'single_file' permission for access policy file(s)`);
-      throw new GithubAccessTokenError([{
-        owner: tokenRequest.owner,
-        // BE AWARE to prevent leaking owner existence
-        issues: callerIdentity.repository !== `${tokenRequest.owner}/${options.accessPolicyLocation.owner.repo}` ?
-            [NOT_AUTHORIZED_MESSAGE] :
-            [`'${GITHUB_APP.name}' installation is missing 'single_file' permission for access policy file(s)`],
-      }], effectiveCallerIdentitySubjects);
-    }
-
-    // --- verify requested token permissions ------------------------------------------------------------------------
-
-    // --- verify app installation permissions ---------------------------------------------------------------------
-    const requestedAppInstallationPermissions = verifyPermissions({
-      granted: normalizePermissionScopes(appInstallation.permissions),
-      requested: tokenRequest.permissions,
-    });
-
-    if (requestedAppInstallationPermissions.denied.length > 0) {
-      // TODO potential security issue: Do not leak app installation permissions
-      throw new GithubAccessTokenError([{
-        owner: tokenRequest.owner,
-        // BE AWARE to prevent leaking owner existence
-        issues: callerIdentity.repository !== `${tokenRequest.owner}/${options.accessPolicyLocation.owner.repo}` ?
-            [NOT_AUTHORIZED_MESSAGE] :
-            requestedAppInstallationPermissions.denied.map(({scope, permission}) => ({
-              scope, permission,
-              message: `Permission has not been granted to '${GITHUB_APP.name}' installation`,
-            })),
-      }], effectiveCallerIdentitySubjects);
+      const accessPolicyPaths = [
+        ...options.accessPolicyLocation.owner.paths,
+        ...options.accessPolicyLocation.repo.paths,
+      ];
+      if (!accessPolicyPaths.every((path) => appInstallation.single_file_paths?.includes(path))) {
+        log.info({owner: tokenRequest.owner, required: accessPolicyPaths, actual: appInstallation.single_file_paths},
+            `'${GITHUB_APP.name}' is not authorized to read all access policy file(s) by 'single_file' permission`);
+        throw new GitHubAccessTokenError([{
+          owner: tokenRequest.owner,
+          // BE AWARE to prevent leaking owner existence
+          issues: callerIdentity.repository_owner === tokenRequest.owner ?
+              [`'${GITHUB_APP.name}' is not authorized to read all access policy file(s) by 'single_file' permission`] :
+              [NOT_AUTHORIZED_MESSAGE],
+        }], effectiveCallerIdentitySubjects);
+      }
     }
 
     const appInstallationClient = await createOctokit(GITHUB_APP_CLIENT, appInstallation, {
       // single_file to read access policy files
       permissions: {single_file: 'read'},
     });
+
+    // === verify requested token permissions against app installation permissions =====================================
+    {
+      const requestedAppInstallationPermissions = verifyPermissions({
+        granted: normalizePermissionScopes(appInstallation.permissions),
+        requested: tokenRequest.permissions,
+      });
+
+      if (requestedAppInstallationPermissions.denied.length > 0) {
+        log.info({owner: tokenRequest.owner, denied: requestedAppInstallationPermissions.denied},
+            `App installation is not authorized`);
+        throw new GitHubAccessTokenError([{
+          owner: tokenRequest.owner,
+          // BE AWARE to prevent leaking owner existence
+          issues: callerIdentity.repository_owner === tokenRequest.owner ?
+              requestedAppInstallationPermissions.denied.map(({scope, permission}) => ({
+                scope, permission,
+                message: `'${GITHUB_APP.name}' installation not authorized`,
+              })) :
+              [NOT_AUTHORIZED_MESSAGE],
+        }], effectiveCallerIdentitySubjects);
+      }
+    }
 
     // --- load owner access policy ----------------------------------------------------------------------------------
     const ownerAccessPolicy = await getOwnerAccessPolicy(appInstallationClient, {
@@ -137,226 +142,239 @@ export async function accessTokenManager(options: {
       strict: false, // ignore invalid access policy entries
     }).catch((error) => {
       if (error instanceof GithubAccessPolicyError) {
-        log.debug({issues: error.issues}, `'${tokenRequest.owner}' access policy`);
-        throw new GithubAccessTokenError([{
+        log.info({owner: tokenRequest.owner, issues: error.issues},
+            'Owner access policy - invalid');
+        throw new GitHubAccessTokenError([{
           owner: tokenRequest.owner,
           // BE AWARE to prevent leaking owner existence
-          issues: tokenRequest.owner !== callerIdentity.repository_owner ?
-              [NOT_AUTHORIZED_MESSAGE] :
-              [formatAccessPolicyError(error)],
-
+          issues: callerIdentity.repository === `${tokenRequest.owner}/${options.accessPolicyLocation.owner.repo}` ?
+              [formatAccessPolicyError(error)] :
+              tokenRequest.owner === callerIdentity.repository_owner ?
+                  [error.message] :
+                  [NOT_AUTHORIZED_MESSAGE],
         }], effectiveCallerIdentitySubjects);
       }
       throw error;
     });
-    log.debug({ownerAccessPolicy}, `${tokenRequest.owner} access policy:`);
+    log.debug({owner: tokenRequest.owner, ownerAccessPolicy}, 'Owner access policy');
 
-    // --- verify allowed caller identities --------------------------------------------------------------------------
+    // === verify allowed caller identities ============================================================================
+    {
+      // if allowed-subjects is not defined, allow any subjects from the policy owner
+      const allowedSubjects = ownerAccessPolicy['allowed-subjects'] ??
+          [`repo:${tokenRequest.owner}/*:**`]; // e.g., ['repo:qoomon/*:**' ]
 
-    // if allowed-subjects is not defined, allow any subjects from the policy owner
-    const allowedSubjects = ownerAccessPolicy['allowed-subjects'] ??
-        [`repo:${tokenRequest.owner}/*:**`]; // e.g., ['repo:qoomon/*:**' ]
-
-    if (!matchSubject(allowedSubjects, effectiveCallerIdentitySubjects)) {
-      throw new GithubAccessTokenError([{
-        owner: tokenRequest.owner,
-        // BE AWARE to prevent leaking owner existence
-        issues: tokenRequest.owner !== callerIdentity.repository_owner ?
-            [NOT_AUTHORIZED_MESSAGE] :
-            ['OIDC token subject is not allowed by owner access policy'],
-      }], effectiveCallerIdentitySubjects);
+      if (!matchSubject(allowedSubjects, effectiveCallerIdentitySubjects)) {
+        log.info({owner: tokenRequest.owner},
+            'OIDC token subject is not allowed by owner access policy');
+        throw new GitHubAccessTokenError([{
+          owner: tokenRequest.owner,
+          // BE AWARE to prevent leaking owner existence
+          issues: callerIdentity.repository_owner === tokenRequest.owner ?
+              ['OIDC token subject is not allowed by owner access policy'] :
+              [NOT_AUTHORIZED_MESSAGE],
+        }], effectiveCallerIdentitySubjects);
+      }
     }
 
-    // grant requested permissions explicitly to prevent accidental permission escalation
-    const grantedTokenPermissions: Record<string, string> = {};
-    const pendingTokenPermissions: Record<string, string> = {...tokenRequest.permissions};
+    // === verify requested token permissions against access policies ==================================================
+    {
+      const ownerGrantedPermissions = evaluateGrantedPermissions({
+        statements: ownerAccessPolicy.statements,
+        callerIdentitySubjects: effectiveCallerIdentitySubjects,
+      });
 
-    const ownerGrantedPermissions = evaluateGrantedPermissions({
-      statements: ownerAccessPolicy.statements,
-      callerIdentitySubjects: effectiveCallerIdentitySubjects,
-    });
+      switch (tokenRequest.scope) {
+        case 'owner': {
+          // === verify requested permissions against OWNER access policy ================================================
 
-    // --- verify scope permissions ----------------------------------------------------------------------------------
-    switch (tokenRequest.scope) {
-      case 'owner': {
-        // --- verify requested permissions against owner access policy ----------------------------------------------
-
-        if (!hasEntries(ownerGrantedPermissions)) {
-          throw new GithubAccessTokenError([{
-            owner: tokenRequest.owner,
-            // BE AWARE to prevent leaking owner existence
-            issues: [NOT_AUTHORIZED_MESSAGE],
-          }], effectiveCallerIdentitySubjects);
-        }
-
-        const requestedOwnerPermissions = verifyPermissions({
-          granted: ownerGrantedPermissions,
-          requested: tokenRequest.permissions,
-        });
-
-        // -- deny permissions
-        if (requestedOwnerPermissions.denied.length > 0) {
-          throw new GithubAccessTokenError([{
-            owner: tokenRequest.owner,
-            issues: requestedOwnerPermissions.denied.map(({scope, permission}) => ({
-              scope, permission,
-              message: NOT_AUTHORIZED_MESSAGE,
-            })),
-          }], effectiveCallerIdentitySubjects);
-        }
-
-        // --- grant permissions
-        requestedOwnerPermissions.granted.forEach(({scope, permission}) => {
-          grantedTokenPermissions[scope] = permission;
-          // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
-          delete pendingTokenPermissions[scope];
-        });
-
-        break;
-      }
-      case 'repos': {
-        // --- verify requested permissions against OWNER access policy ----------------------------------------------
-        {
-          // --- grant repository permissions that are granted by OWNER access policy
-          {
-            const requestedRepositoryPermissions = verifyPermissions({
-              // BE AWARE to grant repository permissions only
-              granted: verifyRepositoryPermissions(ownerGrantedPermissions).valid,
-              requested: pendingTokenPermissions,
-            });
-
-            // --- grant permissions
-            requestedRepositoryPermissions.granted.forEach(({scope, permission}) => {
-              grantedTokenPermissions[scope] = permission;
-              // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
-              delete pendingTokenPermissions[scope];
-            });
+          if (!hasEntries(ownerGrantedPermissions)) {
+            log.info({owner: tokenRequest.owner},
+                'Owner access policy - no permissions granted');
+            throw new GitHubAccessTokenError([{
+              owner: tokenRequest.owner,
+              // BE AWARE to prevent leaking owner existence
+              issues: [NOT_AUTHORIZED_MESSAGE],
+            }], effectiveCallerIdentitySubjects);
           }
 
-          // --- deny pending repository permissions that are not allowed by OWNER access policy
-          {
-            const requestedRepositoryPermissions = verifyPermissions({
-              // BE AWARE to grant repository permissions only
-              granted: verifyRepositoryPermissions(ownerAccessPolicy['allowed-repository-permissions']).valid,
-              requested: pendingTokenPermissions,
-            });
+          const requestedOwnerPermissions = verifyPermissions({
+            granted: ownerGrantedPermissions,
+            requested: tokenRequest.permissions,
+          });
 
-            // -- deny permissions
-            if (requestedRepositoryPermissions.denied.length > 0) {
-              throw new GithubAccessTokenError([{
-                owner: tokenRequest.owner,
-                issues: requestedRepositoryPermissions.denied.map(({scope, permission}) => ({
-                  scope, permission,
-                  message: NOT_AUTHORIZED_MESSAGE, // TODO set detailed message, if tokenRequest.owner === callerIdentity.repository_owner
-                })),
-              }], effectiveCallerIdentitySubjects);
+          // -- deny permissions
+          if (requestedOwnerPermissions.denied.length > 0) {
+            log.info({owner: tokenRequest.owner, denied: requestedOwnerPermissions.denied},
+                'Owner access policy - permission(s) not granted');
+            throw new GitHubAccessTokenError([{
+              owner: tokenRequest.owner,
+              issues: requestedOwnerPermissions.denied.map(({scope, permission}) => ({
+                scope, permission,
+                message: NOT_AUTHORIZED_MESSAGE,
+              })),
+            }], effectiveCallerIdentitySubjects);
+          }
+
+          // --- grant permissions
+          requestedOwnerPermissions.granted.forEach(({scope, permission}) => {
+            grantedTokenPermissions[scope] = permission;
+            // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
+            delete pendingTokenPermissions[scope];
+          });
+
+          break;
+        }
+        case 'repos': {
+          // === verify requested permissions against OWNER access policy ================================================
+          {
+            // --- grant repository permissions that are granted by OWNER access policy
+            {
+              const requestedRepositoryPermissions = verifyPermissions({
+                // BE AWARE to grant repository permissions only
+                granted: verifyRepositoryPermissions(ownerGrantedPermissions).valid,
+                requested: pendingTokenPermissions,
+              });
+
+              // --- grant permissions
+              requestedRepositoryPermissions.granted.forEach(({scope, permission}) => {
+                grantedTokenPermissions[scope] = permission;
+                // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
+                delete pendingTokenPermissions[scope];
+              });
+            }
+
+            // --- deny pending repository permissions that are not allowed by OWNER access policy
+            {
+              const requestedRepositoryPermissions = verifyPermissions({
+                // BE AWARE to grant repository permissions only
+                granted: verifyRepositoryPermissions(ownerAccessPolicy['allowed-repository-permissions']).valid,
+                requested: pendingTokenPermissions,
+              });
+
+              // -- deny permissions
+              if (requestedRepositoryPermissions.denied.length > 0) {
+                log.info({owner: tokenRequest.owner, denied: requestedRepositoryPermissions.denied},
+                    'Owner access policy - repository permission(s) allowed');
+                throw new GitHubAccessTokenError([{
+                  owner: tokenRequest.owner,
+                  issues: requestedRepositoryPermissions.denied.map(({scope, permission}) => ({
+                    scope, permission,
+                    // BE AWARE to prevent leaking owner policy details
+                    message: callerIdentity.repository_owner === tokenRequest.owner ?
+                        'Not allowed by owner access policy' :
+                        NOT_AUTHORIZED_MESSAGE,
+                  })),
+                }], effectiveCallerIdentitySubjects);
+              }
             }
           }
-        }
 
-        // --- verify requested permissions against target REPOSITORY access policies ----------------------------------
-        if (hasEntries(pendingTokenPermissions)) {
-          if (hasEntries(verifyRepositoryPermissions(pendingTokenPermissions).invalid)) {
-            throw new Error('SAFEGUARD Error - Unexpected repository permissions');
-          }
+          // === verify requested permissions against target REPOSITORY access policies ==================================
+          if (hasEntries(pendingTokenPermissions)) {
+            if (hasEntries(verifyRepositoryPermissions(pendingTokenPermissions).invalid)) {
+              throw new Error('SAFEGUARD Error - Unexpected repository permissions');
+            }
 
-          const requestedTokenIssues: ({
-            owner: string,
-            issues: (string | { message: string, scope: string, permission: string })[],
-          } | {
-            owner: string, repo: string,
-            issues: (string | { message: string, scope: string, permission: string })[],
-          })[] = [];
+            const requestedTokenIssues: {
+              owner: string, repo?: string,
+              issues: (string | { message: string, scope: string, permission: string })[],
+            }[] = [];
 
-          const pendingTokenPermissionsByRepository = Object.fromEntries(
-              Object.keys(pendingTokenPermissions)
-                  .map((scope) => [scope, new Set(tokenRequest.repositories)]));
+            const pendingRepositoriesByTokenPermissionScope = Object.fromEntries(
+                Object.keys(pendingTokenPermissions)
+                    .map((scope) => [scope, new Set(tokenRequest.repositories)]));
 
-          const limitRepoPermissionRequests = limit(8);
-          await Promise.all(
-              tokenRequest.repositories.map((repo) => limitRepoPermissionRequests(async () => {
-                const targetRepository = `${tokenRequest.owner}/${repo}`;
-                const repoAccessPolicyResult = await safePromise(getRepoAccessPolicy(appInstallationClient, {
-                  ...parseRepository(targetRepository),
-                  paths: options.accessPolicyLocation.repo.paths,
-                  strict: false, // ignore invalid access policy entries
-                }));
+            const limitRepoPermissionRequests = limit(8);
+            await Promise.all(
+                tokenRequest.repositories.map((repo) => limitRepoPermissionRequests(async () => {
+                  const targetRepository = `${tokenRequest.owner}/${repo}`;
+                  const repoAccessPolicyResult = await safePromise(getRepoAccessPolicy(appInstallationClient, {
+                    ...parseRepository(targetRepository),
+                    paths: options.accessPolicyLocation.repo.paths,
+                    strict: false, // ignore invalid access policy entries
+                  }));
 
-                if (!repoAccessPolicyResult.success) {
-                  const error = repoAccessPolicyResult.error;
-                  if (error instanceof GithubAccessPolicyError) {
-                    log.debug({issues: error.issues}, `'${targetRepository}' access policy`);
+                  if (!repoAccessPolicyResult.success) {
+                    const error = repoAccessPolicyResult.error;
+                    if (error instanceof GithubAccessPolicyError) {
+                      log.info({owner: tokenRequest.owner, repo, issues: error.issues},
+                          'Repository access policy - invalid');
+                      requestedTokenIssues.push({
+                        owner: tokenRequest.owner, repo,
+                        issues: callerIdentity.repository_owner === tokenRequest.owner ?
+                            [formatAccessPolicyError(error)] :
+                            [NOT_AUTHORIZED_MESSAGE],
+                      });
+                      return;
+                    }
+                    throw error;
+                  }
+
+                  const repoAccessPolicy = repoAccessPolicyResult.data;
+                  log.debug({owner: tokenRequest.owner, repo, repoAccessPolicy},
+                      'Repository access policy');
+
+                  const repoGrantedPermissions = evaluateGrantedPermissions({
+                    statements: repoAccessPolicy.statements,
+                    callerIdentitySubjects: effectiveCallerIdentitySubjects,
+                  });
+                  if (!hasEntries(repoGrantedPermissions)) {
+                    log.info({owner: tokenRequest.owner, repo},
+                        'Repository access policy - no permissions granted');
                     requestedTokenIssues.push({
                       owner: tokenRequest.owner, repo,
-                      issues: tokenRequest.owner !== callerIdentity.repository_owner ?
-                          [NOT_AUTHORIZED_MESSAGE] :
-                          [formatAccessPolicyError(error)],
+                      // BE AWARE to prevent leaking owner existence
+                      issues: [NOT_AUTHORIZED_MESSAGE],
                     });
                     return;
                   }
-                  throw error;
-                }
 
-                const repoAccessPolicy = repoAccessPolicyResult.data;
-                log.debug({repoAccessPolicy}, `'${targetRepository}' access policy`);
-
-                const repoGrantedPermissions = evaluateGrantedPermissions({
-                  statements: repoAccessPolicy.statements,
-                  callerIdentitySubjects: effectiveCallerIdentitySubjects,
-                });
-                if (!hasEntries(repoGrantedPermissions)) {
-                  requestedTokenIssues.push({
-                    owner: tokenRequest.owner, repo,
-                    // BE AWARE to prevent leaking owner existence
-                    issues: [NOT_AUTHORIZED_MESSAGE],
+                  const verifiedRepoPermissions = verifyPermissions({
+                    granted: repoGrantedPermissions,
+                    requested: pendingTokenPermissions,
                   });
-                  return;
-                }
 
-                const verifiedRepoPermissions = verifyPermissions({
-                  granted: repoGrantedPermissions,
-                  requested: pendingTokenPermissions,
-                });
-
-                // --- grant repo permissions that are granted by repo access policy
-                verifiedRepoPermissions.granted.forEach(({scope}) => {
-                  pendingTokenPermissionsByRepository[scope].delete(repo);
-                });
-
-                // --- deny repo permissions that are not granted by repo access policy
-                verifiedRepoPermissions.denied.forEach(({scope, permission}) => {
-                  requestedTokenIssues.push({
-                    owner: tokenRequest.owner, repo,
-                    issues: [{
-                      scope, permission,
-                      message: NOT_AUTHORIZED_MESSAGE,
-                    }],
+                  // --- grant repo permissions that are granted by repo access policy
+                  verifiedRepoPermissions.granted.forEach(({scope}) => {
+                    pendingRepositoriesByTokenPermissionScope[scope].delete(repo);
                   });
-                });
-              })),
-          );
 
-          // --- grant repository permission only if all repositories have granted the specific permission
-          Object.entries(pendingTokenPermissionsByRepository).forEach(([scope, repositories]) => {
-            if (repositories.size == 0) {
-              grantedTokenPermissions[scope] = pendingTokenPermissions[scope];
-              // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
-              delete pendingTokenPermissions[scope];
+                  // --- deny repo permissions that are not granted by repo access policy
+                  verifiedRepoPermissions.denied.forEach(({scope, permission}) => {
+                    requestedTokenIssues.push({
+                      owner: tokenRequest.owner, repo,
+                      issues: [{
+                        scope, permission,
+                        message: NOT_AUTHORIZED_MESSAGE,
+                      }],
+                    });
+                  });
+                })),
+            );
+
+            // --- grant repository permission only if all repositories have granted the specific permission
+            Object.entries(pendingRepositoriesByTokenPermissionScope).forEach(([scope, repositories]) => {
+              if (repositories.size == 0) {
+                grantedTokenPermissions[scope] = pendingTokenPermissions[scope];
+                // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
+                delete pendingTokenPermissions[scope];
+              }
+            });
+
+            if (hasEntries(requestedTokenIssues)) {
+              throw new GitHubAccessTokenError(requestedTokenIssues, effectiveCallerIdentitySubjects);
             }
-          });
-
-          if (hasEntries(requestedTokenIssues)) {
-            throw new GithubAccessTokenError(requestedTokenIssues, effectiveCallerIdentitySubjects);
           }
-        }
 
-        break;
+          break;
+        }
+        default:
+          throw new Error('SAFEGUARD Error - Unexpected token scope');
       }
-      default:
-        throw new Error('SAFEGUARD Error - Unexpected token scope');
     }
 
-    // --- create requested access token -------------------------------------------------------------------------------
+    // === create requested access token ===============================================================================
     if (hasEntries(pendingTokenPermissions)) {
       throw new Error('SAFEGUARD Error - Unexpected pending permissions');
     }
@@ -371,7 +389,6 @@ export async function accessTokenManager(options: {
       repositories: tokenRequest.scope === 'repos' ? ensureHasEntries(tokenRequest.repositories) :
           tokenRequest.repositories,
     });
-
     return {
       owner: appInstallation.account?.name ?? tokenRequest.owner,
       ...accessToken,
@@ -425,6 +442,23 @@ async function getOwnerAccessPolicy(client: Octokit, {
     throw new GithubAccessPolicyError(`Access policy not found`);
   }
 
+  const normalizeAccessPolicyEntries = (policy: unknown) => {
+    if (isRecord(policy)) {
+      if (isRecord(policy['allowed-repository-permissions'])) {
+        policy['allowed-repository-permissions'] = normalizePermissionScopes(policy['allowed-repository-permissions']);
+      }
+      if (Array.isArray(policy.statements)) {
+        policy.statements = policy.statements.map((statement: unknown) => {
+          if (isRecord(statement) && isRecord(statement.permissions)) {
+            statement.permissions = normalizePermissionScopes(statement.permissions);
+          }
+          return statement;
+        });
+      }
+    }
+    return policy;
+  };
+
   const filterInvalidAccessPolicyEntries = (policy: unknown) => {
     if (isRecord(policy)) {
       if (Array.isArray(policy['allowed-subjects'])) {
@@ -440,11 +474,11 @@ async function getOwnerAccessPolicy(client: Octokit, {
             policy.statements, 'owner');
       }
     }
-
     return policy;
   };
 
   const policyParseResult = YamlTransformer
+      .transform(normalizeAccessPolicyEntries)
       .transform(strict ? (it) => it : filterInvalidAccessPolicyEntries)
       .pipe(GitHubOwnerAccessPolicySchema)
       .safeParse(policyValue);
@@ -499,18 +533,28 @@ async function getRepoAccessPolicy(client: Octokit, {
     throw new GithubAccessPolicyError(`Access policy not found`);
   }
 
-  const filterInvalidAccessPolicyEntries = (policy: unknown) => {
-    if (isRecord(policy)) {
-      if (Array.isArray(policy.statements)) {
-        policy.statements = filterValidStatements(
-            policy.statements, 'repo');
-      }
+  const normalizeAccessPolicyEntries = (policy: unknown) => {
+    if (isRecord(policy) && Array.isArray(policy.statements)) {
+      policy.statements = policy.statements.map((statement: unknown) => {
+        if (isRecord(statement) && isRecord(statement.permissions)) {
+          statement.permissions = normalizePermissionScopes(statement.permissions);
+        }
+        return statement;
+      });
     }
+    return policy;
+  };
 
+  const filterInvalidAccessPolicyEntries = (policy: unknown) => {
+    if (isRecord(policy) && Array.isArray(policy.statements)) {
+      policy.statements = filterValidStatements(
+          policy.statements, 'repo');
+    }
     return policy;
   };
 
   const policyParseResult = YamlTransformer
+      .transform(normalizeAccessPolicyEntries)
       .transform(strict ? (it) => it : filterInvalidAccessPolicyEntries)
       .pipe(GitHubRepositoryAccessPolicySchema)
       .safeParse(policyValue);
@@ -746,26 +790,23 @@ function getEffectiveCallerIdentitySubjects(callerIdentity: GitHubActionsJwtPayl
  * Verify if subject is granted by grantedSubjectPatterns
  * @param subjectPattern - subject pattern
  * @param subject - subject e.g. 'repo:spongebob/sandbox:ref:refs/heads/main'
- * @param strict - strict mode does not allow ** wildcards
  * @return true if subject matches any granted subject pattern
  */
-function matchSubject(subjectPattern: string | string[], subject: string | string[], strict = true): boolean {
+function matchSubject(subjectPattern: string | string[], subject: string | string[]): boolean {
   if (Array.isArray(subject)) {
-    return subject.some((subject) => matchSubject(subjectPattern, subject, false));
+    return subject.some((subject) => matchSubject(subjectPattern, subject));
   }
 
   if (Array.isArray(subjectPattern)) {
-    return subjectPattern.some((subjectPattern) => matchSubject(subjectPattern, subject, false));
+    return subjectPattern.some((subjectPattern) => matchSubject(subjectPattern, subject));
   }
 
-  if (strict && subjectPattern.includes('**')) {
-    return false;
-  }
-
-  // claims must not contain wildcards to prevent granting access accidentally
-  // e.g., repo:foo/bar:* is not allowed
-  if (Object.keys(parseOIDCSubject(subjectPattern))
-      .some((claim) => !claim.includes('**') && claim.includes('*'))) {
+  // subject pattern claims must not contain wildcards to prevent granting access accidentally
+  //   repo:foo/bar:*  is NOT allowed
+  //   repo:foo/bar:** is allowed
+  //   repo:foo/*:**   is allowed
+  const explicitSubjectPattern = subjectPattern.replace(/:\*\*$/, '')
+  if (Object.keys(parseOIDCSubject(explicitSubjectPattern)).some((claim) => claim.includes('*'))) {
     return false;
   }
 
@@ -833,8 +874,7 @@ async function createInstallationAccessToken(client: Octokit, installation: GitH
       scope.replaceAll('-', '_'), permission,
     ])),
     repositories,
-  })
-      .then((res) => res.data);
+  }).then((res) => res.data);
 }
 
 /**
@@ -899,7 +939,7 @@ async function getRepositoryFileContent(client: Octokit, {
 /**
  * Represents a GitHub access token error
  */
-export class GithubAccessTokenError extends Error {
+export class GitHubAccessTokenError extends Error {
   /**
    * Creates a new GitHub access token error
    * @param reasons - error reasons
@@ -936,7 +976,7 @@ export class GithubAccessTokenError extends Error {
 
     super(message);
 
-    Object.setPrototypeOf(this, GithubAccessTokenError.prototype);
+    Object.setPrototypeOf(this, GitHubAccessTokenError.prototype);
   }
 }
 
@@ -957,6 +997,14 @@ export class GithubAccessPolicyError extends Error {
 }
 
 // --- Schemas ---------------------------------------------------------------------------------------------------------
+
+export type GitHubAccessTokenRequest = {
+  scope: 'owner', owner: string, permissions: GitHubAppPermissions,
+  repositories?: string[],
+} | {
+  scope: 'repos', owner: string, permissions: GitHubAppRepositoryPermissions,
+  repositories: string[],
+};
 
 // https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/about-security-hardening-with-openid-connect#example-subject-claims
 const GitHubSubjectClaimSchema = z.string().trim();
